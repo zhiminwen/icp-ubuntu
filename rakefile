@@ -109,7 +109,7 @@ namespace "vm" do
           #cloud-config
           package_update: false
           
-          manage_etc_hosts: true
+          manage_etc_hosts: false
           hostname: #{name}
           
           ssh_authorized_keys: 
@@ -172,7 +172,7 @@ namespace "vm" do
       sh %Q("#{vbox_manage}" startvm #{name} --type headless)
     end
   end
-
+  
   desc "portforward for ssh"
   task "03_ssh_portforward" do
     ipaddr = IPAddr.new(ENV["NODE_IP_START"])
@@ -183,51 +183,34 @@ namespace "vm" do
       ipaddr = ipaddr.succ
     end
   end
+
+  desc "disable cloud init after setup"
+  task "04_disable_cloud_init" do
+    on servers do |host|
+      execute %Q(sudo touch /etc/cloud/cloud-init.disabled)
+    end
+  end
+  
+  desc "stop vm"
+  task "05_stop_vm" do
+    1.upto vm_count do |i|
+      name = "ubuntu#{i}"
+      sh %Q("#{vbox_manage}" controlvm #{name} poweroff)
+    end
+  end
+
+  desc "remove iso"
+  task "06_detach_iso" do
+    1.upto vm_count do |i|
+      name = "ubuntu#{i}"
+      sh %Q("#{vbox_manage}" storageattach "#{name}" --storagectl IDE --port 1 --device 0 --medium none)
+    end
+  end
 end
 
 namespace "sw" do
-  desc "increase filesystem size"
-  task "01_increase_filesystem" do
-    on servers do |host|
-      cmds = ShellCommandConstructor.construct_command %Q{
-        pvcreate /dev/sdb
-        vgextend /dev/ubuntu-vg /dev/sdb
-        lvextend -l +100%FREE /dev/ubuntu-vg/root
-        resize2fs /dev/ubuntu-vg/root
-      }
-
-      execute %Q(sudo bash -c "#{cmds}")
-    end
-  end
-
-  desc "install docker"
-  task "02_install_docker" do
-    on servers do |host|
-      cmds = ShellCommandConstructor.construct_command %Q{
-        #  sudo apt-get remove docker docker-engine docker-ce docker.io
-        
-        # sudo apt-get -y update
-        # sudo apt-get -y install apt-transport-https ca-certificates curl software-properties-common
-        # curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
-        # sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
-        
-        # sudo apt-get -y update
-        sudo apt-get -y install docker-ce=#{ENV["DOCKER_PACKAGE_VERSION"]}
-      }
-
-      execute cmds
-    end
-  end
-
-  desc "install python"
-  task "03_install_python" do
-    on servers do |host|
-      execute %Q(sudo apt-get -y install python)
-    end
-  end
-
-  desc "update hosts"
-  task "04_update_etc_hosts" do
+  desc "update /etc/hosts as first step to resolve hostname correctly"
+  task "01_update_etc_hosts" do
     on servers do |host|
       list = []
       %w(MASTER_HOSTNAME_IP WORKER_HOSTNAME_IP PROXY_HOSTNAME_IP).each do |key|
@@ -241,6 +224,46 @@ namespace "sw" do
       end
     end
   end
+
+  desc "increase filesystem size"
+  task "02_increase_filesystem" do
+    on servers do |host|
+      cmds = ShellCommandConstructor.construct_command %Q{
+        pvcreate /dev/sdb
+        vgextend /dev/ubuntu-vg /dev/sdb
+        lvextend -l +100%FREE /dev/ubuntu-vg/root
+        resize2fs /dev/ubuntu-vg/root
+      }
+
+      execute %Q(sudo bash -c "#{cmds}")
+    end
+  end
+
+  desc "install docker"
+  task "03_install_docker" do
+    on servers do |host|
+      cmds = ShellCommandConstructor.construct_command %Q{
+        # sudo apt-get remove docker docker-engine docker-ce docker.io
+        
+        sudo apt-get -y update
+        sudo apt-get -y install apt-transport-https ca-certificates curl software-properties-common
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+        sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+        
+        sudo apt-get -y update
+        sudo apt-get -y install docker-ce=#{ENV["DOCKER_PACKAGE_VERSION"]}
+      }
+
+      execute cmds
+    end
+  end
+
+  desc "install python"
+  task "04_install_python" do
+    on servers do |host|
+      execute %Q(sudo apt-get -y install python)
+    end  
+  end  
 
   desc "tune system parameters"
   task "05_tune" do
@@ -375,6 +398,5 @@ namespace "sw" do
 
 end
 
-__END__
 
 

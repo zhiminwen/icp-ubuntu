@@ -61,10 +61,10 @@ ICP_INSTALLER_ON_HOST=C:\Users\IBM_ADMIN\Downloads\ibm-cloud-private-installer-1
 ```
 cd icp-ubuntu
 rake -T
-rake sw:01_increase_filesystem          # increase filesystem size
-rake sw:02_install_docker               # install docker
-rake sw:03_install_python               # install python
-rake sw:04_update_etc_hosts             # update hosts
+rake sw:01_update_etc_hosts             # update /etc/hosts as first step t...
+rake sw:02_increase_filesystem          # increase filesystem size
+rake sw:03_install_docker               # install docker
+rake sw:04_install_python               # install python
 rake sw:05_tune                         # tune system parameters
 rake sw:06_create_ssh_key               # create ssh key
 rake sw:07_untar                        # untar
@@ -80,6 +80,9 @@ rake vm:00_build_fleets                 # build fleet (4 ubuntu VMs)
 rake vm:01_create_cloud_init_iso        # create cloud-init iso and mount t...
 rake vm:02_start_vm                     # bootup vm
 rake vm:03_ssh_portforward              # portforward for ssh
+rake vm:04_disable_cloud_init           # disable cloud init after setup
+rake vm:05_stop_vm                      # stop vm
+rake vm:06_detach_iso                   # remove iso
 ```
 
 First build the VM fleets, run the rake task under the namespace of "vm" one by one, ie
@@ -88,15 +91,19 @@ rake vm:00_build_fleets
 rake vm:01_create_cloud_init_iso
 rake vm:02_start_vm
 rake vm:03_ssh_portforward
+rake vm:04_disable_cloud_init
+rake vm:05_stop_vm
+rake vm:06_detach_iso
 
+rake vm:02_start_vm
 ```
 
 Then, install IBM Cloud Private step by step as
 ```
-rake sw:01_increase_filesystem
-rake sw:02_install_docker
-rake sw:03_install_python
-rake sw:04_update_etc_hosts
+rake sw:01_update_etc_hosts
+rake sw:02_increase_filesystem
+rake sw:03_install_docker
+rake sw:04_install_python
 rake sw:05_tune
 rake sw:06_create_ssh_key
 rake sw:07_untar
