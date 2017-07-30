@@ -1,0 +1,380 @@
+require 'ipaddr'
+require "sshkit_addon"
+require 'fileutils'
+require "dotenv"
+Dotenv.load
+
+fleet_home = ENV["FLEET_HOME"]
+vbox_manage = ENV["VBOXMANAGE"]
+vm_count = ENV["COUNT_OF_VMS"].to_i
+
+def forwarding_port ipaddr
+  ipaddr.to_s.split(/\./)[-1] + "22"
+end
+
+fleets_ip_list = []
+ipaddr = IPAddr.new(ENV["NODE_IP_START"])
+vms = {}
+1.upto vm_count do |i|
+  vms["ubuntu#{i}"] = { :host => "localhost", :port => forwarding_port(ipaddr), :user => "ubuntu", :key => ENV["MYKEY"], :actual_ip => ipaddr.to_s }
+  fleets_ip_list.push ipaddr.to_s
+  ipaddr = ipaddr.succ
+end
+
+vms.each do |key, hash|
+  hash[:rest_of_ips] = fleets_ip_list - [hash[:actual_ip]]
+end
+
+cap3 = CapBase.new vms
+servers = cap3.servers
+
+namespace "util" do
+  desc "run command"  
+  task :run_command, [:cmd] do |t, args|
+      cmd = args.cmd
+      on servers do |host|
+        execute cmd
+      end  
+  end    
+
+  desc "run command on a specific host"
+  task :run_command_on, [:host_key, :cmd] do |t, args|
+      cmd = args.cmd
+      on cap3.servers_by_hash[args.host_key] do |host|
+        execute cmd
+      end  
+  end    
+end
+
+namespace "vm" do
+  desc "build fleet (4 ubuntu VMs)"
+  task "00_build_fleets" do
+    ova = ENV["OVA_IMAGE"]
+    1.upto vm_count do |i|
+      name = "ubuntu#{i}"
+      sh %Q("#{vbox_manage}" unregistervm "#{name}" --delete & echo ignore error if vm doesnt exist) 
+      
+      vm_home = File.join fleet_home, name
+      disk_file = File.join(vm_home, "#{name}.vdi")
+      para = {
+        "vmname" => name,
+        "cpus" => 2,
+        "memory" => 2048,
+        
+        #each device is having a differnt device list, the unit # is changing per ova
+        #"unit 4" usb
+        #unit 5, network
+        #unit 6 cdrom
+        #unit 7,8 ide
+        "unit 7" => "--ignore",
+        "unit 8" => "--ignore",
+        #unit 9 scsi,
+        "unit 10" => "--disk #{disk_file}"
+      }
+      args=[]
+      para.each do |key, value|
+        args.push "--vsys 0 --#{key} #{value}"
+      end
+
+      sh %Q("#{vbox_manage}" import "#{ova}" #{args.join " "})
+
+      sh %Q("#{vbox_manage}" modifyvm "#{name}" --nic1 natnetwork)
+      
+      # sh %Q("#{vbox_manage}" modifymedium disk "#{disk_file}" --resize #{40*1024}) #in MiB, difficult to repartion. 
+      #add disk instead
+      new_disk_file = File.join(vm_home, "#{name}_extra_disk.vdi")
+      sh %Q("#{vbox_manage}" createmedium disk --filename #{new_disk_file} --size #{30*1024})
+      sh %Q("#{vbox_manage}" storageattach #{name} --storagectl SCSI --port 1 --device 0 --type hdd --medium #{new_disk_file})
+    end
+  end
+
+  desc "create cloud-init iso and mount to the VM"
+  task "01_create_cloud_init_iso" do
+    ipaddr = IPAddr.new(ENV["NODE_IP_START"])
+
+    1.upto vm_count do |i|
+      name = "ubuntu#{i}"
+      #get mac address
+      mac1 = %x("#{vbox_manage}" showvminfo "#{name}" --machinereadable | grep macaddress1)
+      # macaddress1="080027C721CB"
+      mac_formatted=[]
+      mac1.split(/=/)[1].gsub(/"/, "").split(//).each_slice(2) do |a|
+        mac_formatted.push a.join("")
+      end
+      macaddress = mac_formatted.join(":").gsub(/:$/, "").downcase
+      puts macaddress
+
+      File.open "user-data", "w" do |fh|
+        fh.puts <<~EOF
+          #cloud-config
+          package_update: false
+          
+          manage_etc_hosts: true
+          hostname: #{name}
+          
+          ssh_authorized_keys: 
+          - #{ENV["PUBKEY"]}
+          
+          # write_files:
+          # - path: /tmp/cloud_init_test
+          #   content: |
+          #     line 1
+          #     line 2
+          #     $(ifconfig -a)
+          
+          # runcmd:
+          # - echo #{ipaddr} #{name} >> /etc/hosts
+          
+          final_message: "The system is finally up, after $UPTIME seconds"
+          EOF
+      end
+
+      File.open "meta-data", "w" do |fh|
+        #nothing useful?
+        fh.puts <<~EOF
+          instance-id: #{name}
+        EOF
+      end
+      
+      File.open "network-config", "w" do |fh|
+        fh.puts <<~EOF
+          version: 1
+          config:
+          - type: physical
+            name: interface0
+            mac_address: #{macaddress}
+            subnets:
+              - type: static
+                address: #{ipaddr}/24
+                gateway: #{ENV["NODE_GATEWAY"]}
+                dns_nameservers:
+                  - #{ENV["NODE_DNS"]}
+                  - 8.8.8.8
+                dns_search:
+                - exemplary
+        EOF
+      end
+
+      iso_file = File.join(fleet_home, name, "#{name}.iso")
+      sh %Q(genisoimage -output #{iso_file} -volid cidata -joliet -rock user-data meta-data network-config)
+      sh %Q("#{vbox_manage}" storageattach "#{name}" --storagectl IDE --port 1 --device 0 --type dvddrive --medium #{iso_file})
+      
+      FileUtils.rm_rf %w(user-data meta-data network-config)
+
+      ipaddr = ipaddr.succ
+    end
+  end
+
+  desc "bootup vm"
+  task "02_start_vm" do
+    1.upto vm_count do |i|
+      name = "ubuntu#{i}"
+      sh %Q("#{vbox_manage}" startvm #{name} --type headless)
+    end
+  end
+
+  desc "portforward for ssh"
+  task "03_ssh_portforward" do
+    ipaddr = IPAddr.new(ENV["NODE_IP_START"])
+    1.upto vm_count do |i|
+      name = "ubuntu#{i}"
+      src_port = forwarding_port ipaddr
+      sh %Q("#{vbox_manage}"  natnetwork modify --netname NatNetwork --port-forward-4 "#{name}:tcp:[]:#{src_port}:[#{ipaddr}]:22)
+      ipaddr = ipaddr.succ
+    end
+  end
+end
+
+namespace "sw" do
+  desc "increase filesystem size"
+  task "01_increase_filesystem" do
+    on servers do |host|
+      cmds = ShellCommandConstructor.construct_command %Q{
+        pvcreate /dev/sdb
+        vgextend /dev/ubuntu-vg /dev/sdb
+        lvextend -l +100%FREE /dev/ubuntu-vg/root
+        resize2fs /dev/ubuntu-vg/root
+      }
+
+      execute %Q(sudo bash -c "#{cmds}")
+    end
+  end
+
+  desc "install docker"
+  task "02_install_docker" do
+    on servers do |host|
+      cmds = ShellCommandConstructor.construct_command %Q{
+        #  sudo apt-get remove docker docker-engine docker-ce docker.io
+        
+        # sudo apt-get -y update
+        # sudo apt-get -y install apt-transport-https ca-certificates curl software-properties-common
+        # curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+        # sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+        
+        # sudo apt-get -y update
+        sudo apt-get -y install docker-ce=#{ENV["DOCKER_PACKAGE_VERSION"]}
+      }
+
+      execute cmds
+    end
+  end
+
+  desc "install python"
+  task "03_install_python" do
+    on servers do |host|
+      execute %Q(sudo apt-get -y install python)
+    end
+  end
+
+  desc "update hosts"
+  task "04_update_etc_hosts" do
+    on servers do |host|
+      list = []
+      %w(MASTER_HOSTNAME_IP WORKER_HOSTNAME_IP PROXY_HOSTNAME_IP).each do |key|
+        ENV[key].split(/;/).each do |pair|
+          hostname, ip = pair.split(/,/)
+          list.push sprintf("%s %s", ip, hostname)
+        end
+      end
+      list.each do |line|
+        execute %Q(echo #{line} | sudo tee -a /etc/hosts)
+      end
+    end
+  end
+
+  desc "tune system parameters"
+  task "05_tune" do
+    on servers do |host|
+      cmds = ShellCommandConstructor.construct_command %Q{
+         sudo sysctl -w vm.max_map_count=262144
+         echo vm.max_map_count=262144 | sudo tee -a /etc/sysctl.conf
+      }
+
+      execute cmds
+    end
+  end
+
+  desc "create ssh key"
+  task "06_create_ssh_key" do
+    SSHKit::Backend::Netssh.config.pty = true
+    on servers do |host|
+      execute %Q(sudo ssh-keygen -b 4096 -t rsa -f /root/.ssh/root.id_rsa -N "")
+      
+      #add self key also
+      execute %Q(sudo cat /root/.ssh/root.id_rsa.pub | sudo tee -a /root/.ssh/authorized_keys)
+
+      host.properties.options[:rest_of_ips].each do |peer_ip|
+        execute( %Q(sudo cat /root/.ssh/root.id_rsa.pub | ssh -o StrictHostKeyChecking=no ubuntu@#{peer_ip} "cat - | sudo tee -a /root/.ssh/authorized_keys"), interaction_handler: {
+          /password:/i => "password\n",
+        })
+
+        execute %Q(ssh-keyscan #{peer_ip} | sudo tee -a /root/.ssh/known_hosts)
+      end
+    end
+  end
+
+  desc "untar"
+  task "07_untar" do
+    on cap3.servers_by_hash["ubuntu1"] do |host|
+      execute %Q(mkdir -p icp)
+      %w(ICP_IMAGE_ON_HOST ICP_INSTALLER_ON_HOST).each do |key|
+        next if key=~/^#/
+
+        file = ENV[key]
+        upload! file, "icp/" + File.basename(file)
+      end
+
+      execute %Q(cd icp; tar zxvf #{File.basename ENV["ICP_INSTALLER_ON_HOST"]} )
+    end
+  end
+
+  desc "load docker image"
+  task "08_load_docker_image" do
+    on cap3.servers_by_hash["ubuntu1"] do |host|
+      tarfile = File.basename(ENV["ICP_IMAGE_ON_HOST"])
+      execute %Q(cd icp; tar zxvf #{tarfile} -O | sudo docker load )
+    end
+  end
+
+  desc "prepare install config"
+  task "09_config" do
+    on cap3.servers_by_hash["ubuntu1"] do |host|
+      ip_hash = %w(MASTER_HOSTNAME_IP WORKER_HOSTNAME_IP PROXY_HOSTNAME_IP).each_with_object({}) do |key, hash|
+        ENV[key].split(/;/).each do |pair|
+          _, ip = pair.split(/,/)
+          unless hash.has_key? key
+            hash[key]=[]
+          end
+          hash[key].push ip
+        end
+      end
+
+      content = <<~EOF
+        [master]
+        #{ip_hash["MASTER_HOSTNAME_IP"].join "\n"}
+        
+        [worker]
+        #{ip_hash["WORKER_HOSTNAME_IP"].join "\n"}
+        
+        [proxy]
+        #{ip_hash["PROXY_HOSTNAME_IP"].join "\n"}
+      EOF
+      put content, "icp/ibm-cloud-private-1.2.0/hosts"
+
+      execute %Q(sudo cp /root/.ssh/root.id_rsa /home/ubuntu/icp/ibm-cloud-private-1.2.0/ssh_key)
+      
+      #no change on the config.yaml
+    end
+  end
+
+  desc "move image"
+  task "10_move_image" do
+    on cap3.servers_by_hash["ubuntu1"] do |host|
+      tarfile = File.basename(ENV["ICP_IMAGE_ON_HOST"])
+      execute %Q(cd icp; mv #{tarfile} ibm-cloud-private-1.2.0/images)
+    end
+  end
+
+  desc "install"
+  task "11_install" do
+    on cap3.servers_by_hash["ubuntu1"] do |host|
+      cmds = ShellCommandConstructor.construct_command %Q{
+         cd icp/ibm-cloud-private-1.2.0
+         sudo docker run -e LICENSE=accept --net=host --rm -t -v "$(pwd)":/installer/cluster ibmcom/cfc-installer:1.2.0-ee install -vvv
+      }
+      execute cmds
+    end
+  end
+
+  desc "install kubectl"
+  task "12_install_kubectl" do
+    on cap3.servers_by_hash["ubuntu1"] do |host|
+      execute %Q(sudo docker run -e LICENSE=accept --net=host --rm -v /usr/local/bin:/data ibmcom/kubernetes:v1.6.1 cp /kubectl /data)
+    end
+  end
+
+  desc "configure kubectl. Assume default api port 8001"
+  task "13_config_kubectl" do
+    if ENV["TOKEN"].to_s.strip == "" 
+      raise "Please login on to UI, Select User Name > Configure Client, copy the token, then set TOKEN=token_value"
+    end
+
+    on cap3.servers_by_hash["ubuntu1"] do |host|
+      master_ip = ENV["MASTER_HOSTNAME_IP"].split(/,/)[1]
+      cmds = ShellCommandConstructor.construct_command %Q{
+        kubectl config set-cluster cfc --server=https://#{master_ip}:8001 --insecure-skip-tls-verify=true
+        kubectl config set-context cfc --cluster=cfc
+        kubectl config set-credentials user --token=#{ENV["TOKEN"]}
+        kubectl config set-context cfc --user=user --namespace=default
+        kubectl config use-context cfc
+      }
+
+      execute cmds
+    end
+  end
+
+end
+
+__END__
+
+
