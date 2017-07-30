@@ -17,7 +17,7 @@ gem install sshkit_addon
 - ICP installer and image files are download from IBM passport advantage web site.
 - Optional [cmder](https://github.com/cmderdev/cmder) installed for Windows
 
-## Prepare Ububtu OVA
+## Prepare Ubuntu OVA
 
 Ideally the Ubuntu cloud image is the best candidate to setup the VM. However the current version of the cloud image doesn't boot [Ubuntu](https://cloud-images.ubuntu.com/xenial/current/xenial-server-cloudimg-amd64.ova). See the issue [here](https://bugs.launchpad.net/cloud-images/+bug/1573095) 
 
@@ -108,7 +108,7 @@ rake sw:12_install_kubectl
 rake sw:13_config_kubectl
 ```
 
-step 11 took about 20 miniutes on my W541 laptop.
+step 11 took about 20 minutes on my W541 laptop.
 
 ## Result
 ![Dashboard](dashboard.png)
