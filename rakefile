@@ -109,7 +109,7 @@ namespace "vm" do
           #cloud-config
           package_update: false
           
-          manage_etc_hosts: false
+          manage_etc_hosts: true
           hostname: #{name}
           
           ssh_authorized_keys: 
@@ -150,6 +150,7 @@ namespace "vm" do
                 dns_nameservers:
                   - #{ENV["NODE_DNS"]}
                   - 8.8.8.8
+                  - 4.4.4.4
                 dns_search:
                 - exemplary
         EOF
@@ -179,7 +180,7 @@ namespace "vm" do
     1.upto vm_count do |i|
       name = "ubuntu#{i}"
       src_port = forwarding_port ipaddr
-      sh %Q("#{vbox_manage}"  natnetwork modify --netname NatNetwork --port-forward-4 "#{name}:tcp:[]:#{src_port}:[#{ipaddr}]:22)
+      sh %Q("#{vbox_manage}" natnetwork modify --netname NatNetwork --port-forward-4 "#{name}:tcp:[]:#{src_port}:[#{ipaddr}]:22")
       ipaddr = ipaddr.succ
     end
   end
@@ -212,16 +213,26 @@ namespace "sw" do
   desc "update /etc/hosts as first step to resolve hostname correctly"
   task "01_update_etc_hosts" do
     on servers do |host|
-      list = []
+      list = [
+        "127.0.0.1    localhost",
+        "127.0.1.1       ubuntu",
+        "",
+        "# The following lines are desirable for IPv6 capable hosts",
+        "::1     localhost ip6-localhost ip6-loopback",
+        "ff02::1 ip6-allnodes",
+        "ff02::2 ip6-allrouters",
+      ]
+
       %w(MASTER_HOSTNAME_IP WORKER_HOSTNAME_IP PROXY_HOSTNAME_IP).each do |key|
         ENV[key].split(/;/).each do |pair|
           hostname, ip = pair.split(/,/)
           list.push sprintf("%s %s", ip, hostname)
+
         end
       end
-      list.each do |line|
-        execute %Q(echo #{line} | sudo tee -a /etc/hosts)
-      end
+      list.push ""
+      put list.join("\n"), file = "/tmp/hosts"
+      execute %Q(sudo cp -f /tmp/hosts /etc/hosts)
     end
   end
 
@@ -300,13 +311,20 @@ namespace "sw" do
   task "07_untar" do
     on cap3.servers_by_hash["ubuntu1"] do |host|
       execute %Q(mkdir -p icp)
-      %w(ICP_IMAGE_ON_HOST ICP_INSTALLER_ON_HOST).each do |key|
-        next if key=~/^#/
+    end
+    master_ip = ENV["MASTER_HOSTNAME_IP"].split(/,/)[1]
+    port = forwarding_port(master_ip)
 
-        file = ENV[key]
-        upload! file, "icp/" + File.basename(file)
-      end
+    %w(ICP_IMAGE_ON_HOST ICP_INSTALLER_ON_HOST).each do |key|
+      next if key=~/^#/
+      file = ENV[key]
+      # upload! file, "icp/" + File.basename(file)
+      # native scp is much faster than ruby's upload
 
+      sh %Q(scp -i "#{ENV["MYKEY"]}" -P #{port}  "#{file}" ubuntu@localhost:icp/#{File.basename(file)} )
+    end
+    
+    on cap3.servers_by_hash["ubuntu1"] do |host|
       execute %Q(cd icp; tar zxvf #{File.basename ENV["ICP_INSTALLER_ON_HOST"]} )
     end
   end
@@ -372,22 +390,31 @@ namespace "sw" do
   desc "install kubectl"
   task "12_install_kubectl" do
     on cap3.servers_by_hash["ubuntu1"] do |host|
-      execute %Q(sudo docker run -e LICENSE=accept --net=host --rm -v /usr/local/bin:/data ibmcom/kubernetes:v1.6.1 cp /kubectl /data)
+      #use the existing image, instead of download
+      execute %Q(sudo docker run -e LICENSE=accept --net=host --rm -v /usr/local/bin:/data ibmcom/kubernetes:v1.6.1-ee cp /kubectl /data)
+    end
+  end
+
+  desc "install kubectl"
+  task "13_install_jq" do
+    on cap3.servers_by_hash["ubuntu1"] do |host|
+      execute %Q(sudo apt -y install jq)
     end
   end
 
   desc "configure kubectl. Assume default api port 8001"
-  task "13_config_kubectl" do
+  task "14_config_kubectl" do
     if ENV["TOKEN"].to_s.strip == "" 
-      raise "Please login on to UI, Select User Name > Configure Client, copy the token, then set TOKEN=token_value"
+      raise "Please login on to UI, Select User Name > Configure Client, copy the token, then set TOKEN=token_value, and rerun"
     end
-
+    token=%Q{}
     on cap3.servers_by_hash["ubuntu1"] do |host|
       master_ip = ENV["MASTER_HOSTNAME_IP"].split(/,/)[1]
       cmds = ShellCommandConstructor.construct_command %Q{
         kubectl config set-cluster cfc --server=https://#{master_ip}:8001 --insecure-skip-tls-verify=true
         kubectl config set-context cfc --cluster=cfc
         kubectl config set-credentials user --token=#{ENV["TOKEN"]}
+
         kubectl config set-context cfc --user=user --namespace=default
         kubectl config use-context cfc
       }

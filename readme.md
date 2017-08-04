@@ -91,6 +91,9 @@ rake vm:00_build_fleets
 rake vm:01_create_cloud_init_iso
 rake vm:02_start_vm
 rake vm:03_ssh_portforward
+
+# wait for VM fully up
+
 rake vm:04_disable_cloud_init
 rake vm:05_stop_vm
 rake vm:06_detach_iso
